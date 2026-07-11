@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use alerter::{Alerter, AlerterConfig};
+use alerter::{Alerter, AlerterConfig, DEFAULT_ALERT_THRESHOLD, DEFAULT_WARN_THRESHOLD};
 use models::UsbEvent;
 use profiler::Profiler;
 
@@ -214,6 +214,8 @@ async fn main() {
         .or(file_cfg.log_path)
         .unwrap_or_else(|| DEFAULT_LOG_PATH.to_string());
     let notify = cli.notify || file_cfg.notify.unwrap_or(false);
+    let alert_threshold = file_cfg.alert_threshold.unwrap_or(DEFAULT_ALERT_THRESHOLD);
+    let warn_threshold = file_cfg.warn_threshold.unwrap_or(DEFAULT_WARN_THRESHOLD);
 
     init_logging(cli.foreground);
 
@@ -228,7 +230,13 @@ async fn main() {
         Some(Command::Verify) => cmd_verify(&db_path),
         None | Some(Command::Daemon) => {
             info!("ghostwire v{}", env!("CARGO_PKG_VERSION"));
-            run_daemon(&db_path, &log_path, notify).await
+            let alerter_config = AlerterConfig {
+                log_path: Some(log_path.clone()),
+                desktop_notify: notify,
+                alert_threshold,
+                warn_threshold,
+            };
+            run_daemon(&db_path, &log_path, alerter_config).await
         }
     }
 }
@@ -237,13 +245,10 @@ async fn main() {
 // Daemon
 // =============================================================================
 
-async fn run_daemon(db_path: &str, log_path: &str, notify: bool) {
+async fn run_daemon(db_path: &str, log_path: &str, alerter_config: AlerterConfig) {
     let mut profiler = init_profiler(db_path);
 
-    let alerter = init_alerter(AlerterConfig {
-        log_path: Some(log_path.to_string()),
-        desktop_notify: notify,
-    });
+    let alerter = init_alerter(alerter_config);
 
     let (tx, mut rx) = mpsc::channel::<UsbEvent>(256);
     collector::spawn_collector(tx);
