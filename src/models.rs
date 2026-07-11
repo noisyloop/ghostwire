@@ -67,8 +67,6 @@ pub enum AnomalyFlag {
     DescriptorMismatch,
     /// Known device appeared on a different physical port. (+10)
     NewPort,
-    /// HID device enumerated suspiciously fast (< 100 ms). (+40)
-    HidFastEnum,
     /// Device exposes both HID and mass storage interfaces. (+60)
     CompositeHidStorage,
     /// Interface count changed from the known profile. (+40)
@@ -85,7 +83,6 @@ impl AnomalyFlag {
             AnomalyFlag::UnknownDevice => 30,
             AnomalyFlag::DescriptorMismatch => 50,
             AnomalyFlag::NewPort => 10,
-            AnomalyFlag::HidFastEnum => 40,
             AnomalyFlag::CompositeHidStorage => 60,
             AnomalyFlag::NewInterfaceCount => 40,
             AnomalyFlag::OddHours => 10,
@@ -98,7 +95,6 @@ impl AnomalyFlag {
             AnomalyFlag::UnknownDevice => "UNKNOWN_DEVICE",
             AnomalyFlag::DescriptorMismatch => "DESCRIPTOR_MISMATCH",
             AnomalyFlag::NewPort => "NEW_PORT",
-            AnomalyFlag::HidFastEnum => "HID_FAST_ENUM",
             AnomalyFlag::CompositeHidStorage => "COMPOSITE_HID_STORAGE",
             AnomalyFlag::NewInterfaceCount => "NEW_INTERFACE_COUNT",
             AnomalyFlag::OddHours => "ODD_HOURS",

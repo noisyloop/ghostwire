@@ -8,14 +8,12 @@ use tracing::{error, info, warn};
 
 use crate::models::{AnomalyFlag, AnomalyResult};
 
-/// Score threshold above which a desktop notification is sent.
-const NOTIFY_THRESHOLD: u32 = 50;
+/// Default score at or above which an alert is promoted to ERROR severity
+/// (and a desktop notification is sent, if enabled).
+pub const DEFAULT_ALERT_THRESHOLD: u32 = 50;
 
-/// Score threshold above which an alert is promoted to ERROR severity.
-const CRITICAL_THRESHOLD: u32 = 50;
-
-/// Score threshold above which an alert is promoted to WARN severity.
-const WARN_THRESHOLD: u32 = 20;
+/// Default score at or above which an alert is promoted to WARN severity.
+pub const DEFAULT_WARN_THRESHOLD: u32 = 20;
 
 /// Configuration for the alerter.
 pub struct AlerterConfig {
@@ -24,6 +22,11 @@ pub struct AlerterConfig {
     /// If true, send desktop notifications for high-score events (requires the
     /// `desktop-notify` Cargo feature and a running notification daemon).
     pub desktop_notify: bool,
+    /// Score at or above which an event logs at ERROR and triggers a
+    /// desktop notification.
+    pub alert_threshold: u32,
+    /// Score at or above which an event logs at WARN.
+    pub warn_threshold: u32,
 }
 
 impl Default for AlerterConfig {
@@ -31,6 +34,8 @@ impl Default for AlerterConfig {
         AlerterConfig {
             log_path: None,
             desktop_notify: false,
+            alert_threshold: DEFAULT_ALERT_THRESHOLD,
+            warn_threshold: DEFAULT_WARN_THRESHOLD,
         }
     }
 }
@@ -62,7 +67,7 @@ impl Alerter {
         let flag_strs: Vec<&str> = result.flags.iter().map(AnomalyFlag::as_str).collect();
 
         // ── Tracing output ────────────────────────────────────────────────────
-        if score > CRITICAL_THRESHOLD {
+        if score >= self.config.alert_threshold {
             error!(
                 action  = %event.action,
                 vid     = %event.vid,
@@ -75,7 +80,7 @@ impl Alerter {
                 port    = %event.port_path,
                 "HIGH-RISK USB device — flagged for review"
             );
-        } else if score > WARN_THRESHOLD {
+        } else if score >= self.config.warn_threshold {
             warn!(
                 action  = %event.action,
                 vid     = %event.vid,
@@ -107,7 +112,7 @@ impl Alerter {
         }
 
         // ── Desktop notification (feature-gated) ──────────────────────────────
-        if self.config.desktop_notify && score > NOTIFY_THRESHOLD {
+        if self.config.desktop_notify && score >= self.config.alert_threshold {
             self.send_desktop_notification(result);
         }
     }

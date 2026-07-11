@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Timelike, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -10,18 +9,14 @@ use tracing::warn;
 
 use crate::models::{AnomalyFlag, AnomalyResult, DeviceProfile, UsbEvent};
 
-/// How long to keep a pending-add record before discarding it (stale guard).
-const PENDING_ADD_TTL: Duration = Duration::from_secs(30);
-
-/// A HID or storage device that enumerated faster than this is suspicious.
-const HID_FAST_ENUM_THRESHOLD: Duration = Duration::from_millis(100);
-
 /// Maintains the SQLite trust store and computes anomaly scores.
 pub struct Profiler {
     conn: Connection,
-    /// Maps devpath → Instant of the most recent `add` event for that path.
-    /// Used to compute add→bind elapsed time for HID_FAST_ENUM detection.
-    pending_adds: HashMap<String, Instant>,
+    /// Maps devpath → the fingerprint most recently seen on that path.
+    /// `remove` uevents fire after sysfs attributes are gone, so the
+    /// fingerprint cannot be recomputed at removal time; this map lets remove
+    /// events correlate with the device that was actually unplugged.
+    last_fp_by_port: HashMap<String, String>,
 }
 
 impl Profiler {
@@ -53,7 +48,7 @@ impl Profiler {
 
         let profiler = Profiler {
             conn,
-            pending_adds: HashMap::new(),
+            last_fp_by_port: HashMap::new(),
         };
         profiler.init_schema()?;
         Ok(profiler)
@@ -110,26 +105,14 @@ impl Profiler {
         &mut self,
         event: &UsbEvent,
     ) -> Result<AnomalyResult, Box<dyn std::error::Error>> {
-        // Track add timestamps for HID_FAST_ENUM (Phase 3)
-        if event.action == "add" {
-            self.pending_adds
-                .insert(event.port_path.clone(), Instant::now());
-            self.evict_stale_pending();
-        }
-
-        // For bind events, pull the elapsed time since the corresponding add
-        let add_elapsed: Option<Duration> = if event.action == "bind" {
-            self.pending_adds
-                .remove(&event.port_path)
-                .map(|t| t.elapsed())
-        } else {
-            None
-        };
-
-        // Remove events are logged but not scored
+        // Remove events are logged but not scored. Sysfs attributes are gone
+        // by the time the remove uevent arrives, so use the fingerprint we
+        // recorded when the device was last seen on this port.
         if event.action == "remove" {
-            self.pending_adds.remove(&event.port_path);
-            let fingerprint = compute_fingerprint(event);
+            let fingerprint = self
+                .last_fp_by_port
+                .remove(&event.port_path)
+                .unwrap_or_else(|| compute_fingerprint(event));
             let known = self.get_profile_by_fingerprint(&fingerprint)?;
             let result = AnomalyResult {
                 event: event.clone(),
@@ -137,11 +120,13 @@ impl Profiler {
                 flags: vec![],
                 known_profile: known,
             };
-            self.append_event_log(event, &result)?;
+            self.append_event_log(event, &result, &fingerprint)?;
             return Ok(result);
         }
 
         let fingerprint = compute_fingerprint(event);
+        self.last_fp_by_port
+            .insert(event.port_path.clone(), fingerprint.clone());
         let exact_match = self.get_profile_by_fingerprint(&fingerprint)?;
 
         // If no exact match, look for VID+PID match (potential DESCRIPTOR_MISMATCH)
@@ -151,8 +136,7 @@ impl Profiler {
             vec![]
         };
 
-        let (score, flags) =
-            score_event(event, &exact_match, &vid_pid_matches, add_elapsed);
+        let (score, flags) = score_event(event, &exact_match, &vid_pid_matches);
 
         let known_profile = exact_match
             .clone()
@@ -165,24 +149,29 @@ impl Profiler {
             known_profile: known_profile.clone(),
         };
 
-        // Persist or update device profile
+        // Persist or update device profile. A single plug-in emits several
+        // uevents (add, bind, sometimes change) — only `add` counts as a new
+        // connection; the others just refresh last_seen.
         let now = Utc::now();
         if let Some(ref profile) = exact_match {
+            let increment = if event.action == "add" { 1 } else { 0 };
             self.conn.execute(
                 "UPDATE devices
                     SET last_seen  = ?1,
-                        seen_count = seen_count + 1,
-                        port_path  = ?2
-                  WHERE fingerprint = ?3",
-                params![now.to_rfc3339(), event.port_path, fingerprint],
+                        seen_count = seen_count + ?2,
+                        port_path  = ?3
+                  WHERE fingerprint = ?4",
+                params![now.to_rfc3339(), increment, event.port_path, fingerprint],
             )?;
-            info!(
-                fingerprint = %fingerprint,
-                vid = %event.vid,
-                pid = %event.pid,
-                seen_count = profile.seen_count + 1,
-                "Known device reconnected"
-            );
+            if event.action == "add" {
+                info!(
+                    fingerprint = %fingerprint,
+                    vid = %event.vid,
+                    pid = %event.pid,
+                    seen_count = profile.seen_count + 1,
+                    "Known device reconnected"
+                );
+            }
         } else {
             self.conn.execute(
                 "INSERT INTO devices
@@ -212,7 +201,7 @@ impl Profiler {
             );
         }
 
-        self.append_event_log(event, &result)?;
+        self.append_event_log(event, &result, &fingerprint)?;
         Ok(result)
     }
 
@@ -288,20 +277,25 @@ impl Profiler {
     /// An empty `broken` list means the log is intact.
     pub fn verify_chain(&self) -> Result<ChainVerifyResult, Box<dyn std::error::Error>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, fingerprint, anomaly_score, prev_hash, row_hash
+            "SELECT id, timestamp, action, fingerprint, raw_json,
+                    anomaly_score, anomaly_flags, prev_hash, row_hash
                FROM events
               ORDER BY id ASC",
         )?;
 
-        let rows: Vec<(u64, String, String, u32, Option<String>, String)> = stmt
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(u64, String, String, String, String, u32, Option<String>, Option<String>, String)> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?.max(0) as u64,
                     row.get(1)?,
                     row.get(2)?,
-                    row.get::<_, i64>(3)?.max(0) as u32,
+                    row.get(3)?,
                     row.get(4)?,
-                    row.get(5)?,
+                    row.get::<_, i64>(5)?.max(0) as u32,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
                 ))
             })?
             .filter_map(|r| match r {
@@ -314,7 +308,9 @@ impl Profiler {
         let mut broken: Vec<BrokenLink> = Vec::new();
         let mut expected_prev: &str = "genesis";
 
-        for (id, timestamp, fingerprint, score, prev_hash, row_hash) in &rows {
+        for (id, timestamp, action, fingerprint, raw_json, score, flags, prev_hash, row_hash) in
+            &rows
+        {
             // Check that prev_hash matches what we computed from the prior row
             let stored_prev = prev_hash.as_deref().unwrap_or("genesis");
             if stored_prev != expected_prev {
@@ -328,8 +324,15 @@ impl Profiler {
             }
 
             // Recompute and verify the row's own hash
-            let expected_hash =
-                chain_hash(timestamp, fingerprint, *score, stored_prev);
+            let expected_hash = chain_hash(
+                timestamp,
+                action,
+                fingerprint,
+                raw_json,
+                *score,
+                flags.as_deref().unwrap_or("[]"),
+                stored_prev,
+            );
             if &expected_hash != row_hash {
                 broken.push(BrokenLink {
                     event_id: *id,
@@ -462,8 +465,8 @@ impl Profiler {
         &mut self,
         event: &UsbEvent,
         result: &AnomalyResult,
+        fingerprint: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let fingerprint = compute_fingerprint(event);
         let raw_json = serde_json::to_string(event)?;
         let flags_json = serde_json::to_string(
             &result
@@ -485,8 +488,11 @@ impl Profiler {
         let prev_hash_str = prev_hash.as_deref().unwrap_or("genesis");
         let row_hash = chain_hash(
             &event.timestamp.to_rfc3339(),
-            &fingerprint,
+            &event.action,
+            fingerprint,
+            &raw_json,
             result.score,
+            &flags_json,
             prev_hash_str,
         );
 
@@ -510,26 +516,16 @@ impl Profiler {
         Ok(())
     }
 
-    // -------------------------------------------------------------------------
-    // Internal helpers
-    // -------------------------------------------------------------------------
-
-    /// Remove pending-add entries that are older than PENDING_ADD_TTL.
-    fn evict_stale_pending(&mut self) {
-        self.pending_adds
-            .retain(|_, t| t.elapsed() < PENDING_ADD_TTL);
-    }
 }
 
 // =============================================================================
-// Anomaly scoring (Phase 3 — all 8 flags)
+// Anomaly scoring (Phase 3 — all 7 flags)
 // =============================================================================
 
 fn score_event(
     event: &UsbEvent,
     exact_match: &Option<DeviceProfile>,
     vid_pid_matches: &[DeviceProfile],
-    add_elapsed: Option<Duration>,
 ) -> (u32, Vec<AnomalyFlag>) {
     let mut flags: Vec<AnomalyFlag> = Vec::new();
 
@@ -568,18 +564,6 @@ fn score_event(
     // ── COMPOSITE_HID_STORAGE (+60) ──────────────────────────────────────────
     if has_hid && has_storage {
         flags.push(AnomalyFlag::CompositeHidStorage);
-    }
-
-    // ── HID_FAST_ENUM (+40) ──────────────────────────────────────────────────
-    // Only meaningful on `bind` events where we have an add→bind duration.
-    // A HID device that goes from add to driver-bind in under 100 ms is
-    // suspiciously fast — legitimate HIDs wait for host enumeration.
-    if event.action == "bind" && has_hid {
-        if let Some(elapsed) = add_elapsed {
-            if elapsed < HID_FAST_ENUM_THRESHOLD {
-                flags.push(AnomalyFlag::HidFastEnum);
-            }
-        }
     }
 
     // ── ODD_HOURS (+10) ──────────────────────────────────────────────────────
@@ -700,14 +684,159 @@ fn is_storage(event: &UsbEvent) -> bool {
             .unwrap_or(false)
 }
 
-/// SHA-256(timestamp | fingerprint | score | prev_hash) for the event chain.
-fn chain_hash(timestamp: &str, fingerprint: &str, score: u32, prev_hash: &str) -> String {
+/// SHA-256 over the full event record for the tamper-evident chain:
+/// timestamp | action | fingerprint | raw event JSON | score | flags | prev_hash.
+fn chain_hash(
+    timestamp: &str,
+    action: &str,
+    fingerprint: &str,
+    raw_json: &str,
+    score: u32,
+    flags_json: &str,
+    prev_hash: &str,
+) -> String {
     let mut h = Sha256::new();
-    for part in &[timestamp, fingerprint, &score.to_string(), prev_hash] {
+    for part in &[
+        timestamp,
+        action,
+        fingerprint,
+        raw_json,
+        &score.to_string(),
+        flags_json,
+        prev_hash,
+    ] {
         h.update(part.as_bytes());
         h.update(b"\x00");
     }
     hex::encode(h.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::InterfaceDescriptor;
+
+    fn make_event(action: &str, product: Option<&str>, serial: Option<&str>) -> UsbEvent {
+        UsbEvent {
+            timestamp: Utc::now(),
+            action: action.to_string(),
+            vid: "05ac".to_string(),
+            pid: "0259".to_string(),
+            manufacturer: Some("Acme".to_string()),
+            product: product.map(str::to_string),
+            serial: serial.map(str::to_string),
+            device_class: Some("00".to_string()),
+            subclass: Some("00".to_string()),
+            protocol: Some("00".to_string()),
+            interface_count: Some(1),
+            port_path: "/devices/usb1/1-3".to_string(),
+            bus_num: Some("1".to_string()),
+            dev_num: Some("12".to_string()),
+            interfaces: vec![InterfaceDescriptor {
+                class: "03".to_string(),
+                subclass: "01".to_string(),
+                protocol: "01".to_string(),
+            }],
+        }
+    }
+
+    /// ODD_HOURS depends on the wall clock; strip it so tests are stable.
+    fn stable_flags(result: &AnomalyResult) -> Vec<AnomalyFlag> {
+        result
+            .flags
+            .iter()
+            .filter(|f| **f != AnomalyFlag::OddHours)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn first_sight_flags_unknown_and_missing_serial() {
+        let mut p = Profiler::new(":memory:").unwrap();
+        let result = p.process_event(&make_event("add", Some("Keyboard"), None)).unwrap();
+        assert_eq!(
+            stable_flags(&result),
+            vec![AnomalyFlag::UnknownDevice, AnomalyFlag::SerialMissing]
+        );
+    }
+
+    #[test]
+    fn seen_count_increments_only_on_add() {
+        let mut p = Profiler::new(":memory:").unwrap();
+        p.process_event(&make_event("add", Some("Keyboard"), Some("SN1"))).unwrap();
+        p.process_event(&make_event("bind", Some("Keyboard"), Some("SN1"))).unwrap();
+        p.process_event(&make_event("add", Some("Keyboard"), Some("SN1"))).unwrap();
+
+        let devices = p.list_devices().unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].seen_count, 2, "add+bind+add must count 2, not 3");
+    }
+
+    #[test]
+    fn known_device_does_not_flag_unknown() {
+        let mut p = Profiler::new(":memory:").unwrap();
+        p.process_event(&make_event("add", Some("Keyboard"), Some("SN1"))).unwrap();
+        let result = p.process_event(&make_event("add", Some("Keyboard"), Some("SN1"))).unwrap();
+        assert!(!result.flags.contains(&AnomalyFlag::UnknownDevice));
+        assert!(result.known_profile.is_some());
+    }
+
+    #[test]
+    fn changed_descriptor_flags_mismatch() {
+        let mut p = Profiler::new(":memory:").unwrap();
+        p.process_event(&make_event("add", Some("Keyboard"), Some("SN1"))).unwrap();
+        let result = p.process_event(&make_event("add", Some("Kbd Pro"), Some("SN1"))).unwrap();
+        assert!(result.flags.contains(&AnomalyFlag::DescriptorMismatch));
+        assert!(!result.flags.contains(&AnomalyFlag::UnknownDevice));
+    }
+
+    #[test]
+    fn remove_event_correlates_with_added_device() {
+        let mut p = Profiler::new(":memory:").unwrap();
+        let added = p.process_event(&make_event("add", Some("Keyboard"), Some("SN1"))).unwrap();
+        let add_fp = compute_fingerprint(&added.event);
+
+        // At remove time sysfs attributes are gone — simulate the sparse event.
+        let mut removal = make_event("remove", None, None);
+        removal.manufacturer = None;
+        removal.device_class = None;
+        removal.interface_count = None;
+        removal.interfaces = vec![];
+
+        let result = p.process_event(&removal).unwrap();
+        assert!(result.known_profile.is_some(), "remove must match the added device");
+
+        let events = p.recent_events(1).unwrap();
+        assert_eq!(events[0].action, "remove");
+        assert_eq!(events[0].fingerprint, add_fp);
+    }
+
+    #[test]
+    fn chain_verifies_and_detects_tampering() {
+        let mut p = Profiler::new(":memory:").unwrap();
+        p.process_event(&make_event("add", Some("Keyboard"), Some("SN1"))).unwrap();
+        p.process_event(&make_event("bind", Some("Keyboard"), Some("SN1"))).unwrap();
+        p.process_event(&make_event("add", Some("Mouse"), Some("SN2"))).unwrap();
+
+        let result = p.verify_chain().unwrap();
+        assert_eq!(result.total, 3);
+        assert!(result.is_ok(), "freshly written chain must verify");
+
+        // Tamper with a column that the old chain hash did not cover.
+        p.conn
+            .execute("UPDATE events SET raw_json = '{}' WHERE id = 2", [])
+            .unwrap();
+        let result = p.verify_chain().unwrap();
+        assert!(!result.is_ok(), "raw_json tampering must break the chain");
+
+        // Score tampering must also break it.
+        let mut p2 = Profiler::new(":memory:").unwrap();
+        p2.process_event(&make_event("add", Some("Keyboard"), None)).unwrap();
+        p2.conn
+            .execute("UPDATE events SET anomaly_score = 0 WHERE id = 1", [])
+            .unwrap();
+        assert!(!p2.verify_chain().unwrap().is_ok());
+    }
 }
 
 /// Map a `rusqlite` row to a `DeviceProfile`.
