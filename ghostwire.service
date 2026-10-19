@@ -19,6 +19,9 @@ SyslogIdentifier=ghostwire
 RuntimeDirectory=ghostwire
 StateDirectory=ghostwire
 LogsDirectory=ghostwire
+StateDirectoryMode=0700
+LogsDirectoryMode=0700
+UMask=0077
 
 # Privilege hardening — only CAP_NET_ADMIN needed for the netlink uevent socket
 User=root
@@ -34,6 +37,21 @@ ReadOnlyPaths=/sys
 
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
+
+# Only netlink (uevents) and unix (journald) sockets are ever needed.
+# Do NOT add PrivateNetwork=: uevents are only broadcast to the host netns.
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

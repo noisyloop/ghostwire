@@ -10,6 +10,7 @@ use crate::models::{InterfaceDescriptor, UsbEvent};
 
 // NETLINK_KOBJECT_UEVENT = 15 (from <linux/netlink.h>)
 const NETLINK_KOBJECT_UEVENT: isize = 15;
+const UEVENT_RCVBUF: usize = 1024 * 1024;
 
 /// Spawn a background OS thread that binds a netlink uevent socket and
 /// forwards structured `UsbEvent`s into the provided channel.
@@ -39,13 +40,29 @@ pub fn spawn_collector(tx: mpsc::Sender<UsbEvent>) {
             return;
         }
 
+        // A burst of uevents (hub with many devices) can overflow the default
+        // receive buffer; dropped events are silently missed detections.
+        if let Err(e) = socket.set_rx_buf_sz(UEVENT_RCVBUF) {
+            warn!("Failed to enlarge netlink receive buffer: {}", e);
+        }
+
         info!("USB event collector started — listening on netlink uevent socket");
 
         let mut buf = vec![0u8; 65_536];
 
         loop {
             match socket.recv_from(&mut buf, 0) {
-                Ok((n, _)) => {
+                Ok((n, from)) => {
+                    // Only the kernel (port 0) originates real uevents.
+                    // Anything else is a spoofing attempt and must not
+                    // drive sysfs reads or the trust store.
+                    if from.port_number() != 0 {
+                        warn!(
+                            sender_port = from.port_number(),
+                            "Dropping uevent not sent by the kernel"
+                        );
+                        continue;
+                    }
                     if let Some(event) = parse_uevent(&buf[..n]) {
                         if tx.blocking_send(event).is_err() {
                             warn!("Event channel closed — collector shutting down");
@@ -53,8 +70,13 @@ pub fn spawn_collector(tx: mpsc::Sender<UsbEvent>) {
                         }
                     }
                 }
+                Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                    error!("Netlink receive buffer overrun — USB events were dropped");
+                }
                 Err(e) => {
                     error!("Netlink recv error: {}", e);
+                    // Avoid a hot loop if the error is persistent.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             }
         }
@@ -82,6 +104,12 @@ fn parse_uevent(buf: &[u8]) -> Option<UsbEvent> {
     let header = std::str::from_utf8(parts[0]).ok()?;
     let (action_raw, devpath) = header.split_once('@')?;
     let action = action_raw.to_lowercase();
+
+    // The devpath is joined onto /sys and read from; refuse anything that
+    // could escape the device tree.
+    if !devpath.starts_with("/devices/") || devpath.split('/').any(|c| c == "..") {
+        return None;
+    }
 
     if !matches!(action.as_str(), "add" | "change" | "bind" | "remove") {
         return None;
@@ -238,4 +266,30 @@ fn read_interface_descriptors(sysfs_path: &str) -> Vec<InterfaceDescriptor> {
     }
 
     interfaces
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(header: &str) -> Vec<u8> {
+        let mut m = Vec::new();
+        for part in [header, "SUBSYSTEM=usb", "DEVTYPE=usb_device", "PRODUCT=5ac/259/100"] {
+            m.extend_from_slice(part.as_bytes());
+            m.push(0);
+        }
+        m
+    }
+
+    #[test]
+    fn parses_usb_device_event() {
+        let ev = parse_uevent(&msg("add@/devices/pci0000:00/usb1/1-3")).unwrap();
+        assert_eq!((ev.vid.as_str(), ev.pid.as_str()), ("05ac", "0259"));
+    }
+
+    #[test]
+    fn rejects_devpath_outside_device_tree() {
+        assert!(parse_uevent(&msg("add@/devices/../../etc")).is_none());
+        assert!(parse_uevent(&msg("add@/etc")).is_none());
+    }
 }

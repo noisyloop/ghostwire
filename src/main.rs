@@ -201,6 +201,13 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    // The trust store, its WAL/SHM side files and the event log hold
+    // security-sensitive data; keep everything we create owner-only.
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(0o077);
+    }
+
     let cli = Cli::parse();
     let file_cfg = Config::load();
 
@@ -259,11 +266,26 @@ async fn run_daemon(db_path: &str, log_path: &str, alerter_config: AlerterConfig
         let result = tokio::task::block_in_place(|| profiler.process_event(&event));
         match result {
             Ok(r) => alerter.handle(&r),
-            Err(e) => error!("Error processing USB event: {}", e),
+            // Fail loudly: the device still connected even though we could
+            // not score or record it.
+            Err(e) => error!(
+                action  = %event.action,
+                vid     = %event.vid,
+                pid     = %event.pid,
+                product = ?event.product,
+                mfr     = ?event.manufacturer,
+                port    = %event.port_path,
+                err     = %e,
+                "USB event NOT scored or recorded — review manually"
+            ),
         }
     }
 
-    info!("ghostwire shutting down");
+    // The channel only closes when the collector thread dies, which means we
+    // are no longer monitoring anything. Exit non-zero so systemd's
+    // Restart=on-failure brings us back.
+    error!("USB event collector stopped — ghostwire is no longer monitoring");
+    std::process::exit(1);
 }
 
 // =============================================================================
@@ -286,17 +308,18 @@ fn cmd_list(db_path: &str) {
     println!("{}", "-".repeat(110));
 
     for d in &devices {
-        let fp_short = &d.fingerprint[..16];
-        let product = d
-            .product
-            .as_deref()
-            .or(d.manufacturer.as_deref())
-            .unwrap_or("-");
+        let fp_short = short_fp(&d.fingerprint);
+        let product = sanitize(
+            d.product
+                .as_deref()
+                .or(d.manufacturer.as_deref())
+                .unwrap_or("-"),
+        );
         let trust = if d.trusted { "yes" } else { "no" };
         let last = d.last_seen.format("%Y-%m-%d %H:%M:%S").to_string();
         println!(
             "{:<16}  {:<6}  {:<6}  {:<8}  {:<5}  {:<30}  {}",
-            fp_short, d.vid, d.pid, d.seen_count, trust, product, last
+            fp_short, sanitize(&d.vid), sanitize(&d.pid), d.seen_count, trust, product, last
         );
     }
     println!("\n{} device(s) total.", devices.len());
@@ -304,44 +327,19 @@ fn cmd_list(db_path: &str) {
 
 fn cmd_show(db_path: &str, fingerprint: &str) {
     let profiler = open_profiler_ro(db_path);
+    let d = resolve_device(&profiler, fingerprint);
 
-    // Support prefix matching: collect all devices and filter
-    let devices = unwrap_or_exit(profiler.list_devices(), "list devices");
-    let matches: Vec<_> = devices
-        .iter()
-        .filter(|d| d.fingerprint.starts_with(fingerprint))
-        .collect();
-
-    match matches.len() {
-        0 => {
-            eprintln!("error: no device matching fingerprint prefix '{}'", fingerprint);
-            std::process::exit(1);
-        }
-        n if n > 1 => {
-            eprintln!(
-                "error: ambiguous fingerprint prefix '{}' matches {} devices — be more specific",
-                fingerprint, n
-            );
-            for d in &matches {
-                eprintln!("  {}", d.fingerprint);
-            }
-            std::process::exit(1);
-        }
-        _ => {}
-    }
-
-    let d = matches[0];
-    println!("Fingerprint  : {}", d.fingerprint);
-    println!("VID / PID    : {} / {}", d.vid, d.pid);
+    println!("Fingerprint  : {}", sanitize(&d.fingerprint));
+    println!("VID / PID    : {} / {}", sanitize(&d.vid), sanitize(&d.pid));
     println!(
         "Manufacturer : {}",
-        d.manufacturer.as_deref().unwrap_or("-")
+        sanitize(d.manufacturer.as_deref().unwrap_or("-"))
     );
-    println!("Product      : {}", d.product.as_deref().unwrap_or("-"));
-    println!("Serial       : {}", d.serial.as_deref().unwrap_or("-"));
+    println!("Product      : {}", sanitize(d.product.as_deref().unwrap_or("-")));
+    println!("Serial       : {}", sanitize(d.serial.as_deref().unwrap_or("-")));
     println!(
         "Device class : {}",
-        d.device_class.as_deref().unwrap_or("-")
+        sanitize(d.device_class.as_deref().unwrap_or("-"))
     );
     println!(
         "Interfaces   : {}",
@@ -349,15 +347,16 @@ fn cmd_show(db_path: &str, fingerprint: &str) {
             .map(|c| c.to_string())
             .unwrap_or_else(|| "-".to_string())
     );
-    println!("Port path    : {}", d.port_path);
+    println!("Port path    : {}", sanitize(&d.port_path));
     println!("First seen   : {}", d.first_seen.format("%Y-%m-%d %H:%M:%S UTC"));
     println!("Last seen    : {}", d.last_seen.format("%Y-%m-%d %H:%M:%S UTC"));
     println!("Seen count   : {}", d.seen_count);
     println!("Trusted      : {}", if d.trusted { "yes" } else { "no" });
 }
 
-fn cmd_trust(db_path: &str, fingerprint: &str) {
+fn cmd_trust(db_path: &str, prefix: &str) {
     let mut profiler = open_profiler_rw(db_path);
+    let fingerprint = &resolve_device(&profiler, prefix).fingerprint;
     match unwrap_or_exit(profiler.trust_device(fingerprint), "trust device") {
         true => println!("Marked {} as trusted.", fingerprint),
         false => {
@@ -367,8 +366,9 @@ fn cmd_trust(db_path: &str, fingerprint: &str) {
     }
 }
 
-fn cmd_untrust(db_path: &str, fingerprint: &str) {
+fn cmd_untrust(db_path: &str, prefix: &str) {
     let mut profiler = open_profiler_rw(db_path);
+    let fingerprint = &resolve_device(&profiler, prefix).fingerprint;
     match unwrap_or_exit(profiler.untrust_device(fingerprint), "untrust device") {
         true => println!("Removed trust from {}.", fingerprint),
         false => {
@@ -378,8 +378,9 @@ fn cmd_untrust(db_path: &str, fingerprint: &str) {
     }
 }
 
-fn cmd_forget(db_path: &str, fingerprint: &str) {
+fn cmd_forget(db_path: &str, prefix: &str) {
     let mut profiler = open_profiler_rw(db_path);
+    let fingerprint = &resolve_device(&profiler, prefix).fingerprint;
     match unwrap_or_exit(profiler.forget_device(fingerprint), "forget device") {
         true => println!(
             "Removed {} from the trust store.\n\
@@ -409,7 +410,7 @@ fn cmd_history(db_path: &str, limit: u32) {
     println!("{}", "-".repeat(100));
 
     for row in &rows {
-        let fp_short = &row.fingerprint[..16];
+        let fp_short = short_fp(&row.fingerprint);
         let flags = row
             .anomaly_flags
             .as_deref()
@@ -418,7 +419,7 @@ fn cmd_history(db_path: &str, limit: u32) {
             .replace('"', "");
         println!(
             "{:>6}  {:<25}  {:<7}  {:<16}  {:>6}  {}",
-            row.id, row.timestamp, row.action, fp_short, row.anomaly_score, flags
+            row.id, sanitize(&row.timestamp), sanitize(&row.action), fp_short, row.anomaly_score, sanitize(&flags)
         );
     }
 }
@@ -459,6 +460,62 @@ fn cmd_verify(db_path: &str) {
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// Resolve a fingerprint or unique fingerprint prefix (as printed by `list`)
+/// to a single profile, exiting with an error if it is missing or ambiguous.
+fn resolve_device(profiler: &Profiler, prefix: &str) -> models::DeviceProfile {
+    if prefix.is_empty() {
+        eprintln!("error: empty fingerprint");
+        std::process::exit(1);
+    }
+    let prefix = prefix.to_ascii_lowercase();
+    let devices = unwrap_or_exit(profiler.list_devices(), "list devices");
+    let mut matches: Vec<_> = devices
+        .into_iter()
+        .filter(|d| d.fingerprint.starts_with(&prefix))
+        .collect();
+
+    match matches.len() {
+        0 => {
+            eprintln!("error: no device matching fingerprint prefix '{}'", sanitize(&prefix));
+            std::process::exit(1);
+        }
+        1 => matches.remove(0),
+        n => {
+            eprintln!(
+                "error: ambiguous fingerprint prefix '{}' matches {} devices — be more specific",
+                sanitize(&prefix),
+                n
+            );
+            for d in &matches {
+                eprintln!("  {}", sanitize(&d.fingerprint));
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// First 16 chars of a fingerprint, without panicking on short/corrupt rows.
+fn short_fp(fp: &str) -> &str {
+    fp.get(..16).unwrap_or(fp)
+}
+
+/// Escape control characters before printing device-supplied strings.
+///
+/// Manufacturer/product/serial come straight from the device's USB string
+/// descriptors, so a malicious device can embed terminal escape sequences
+/// that would execute in the admin's terminal on `list` / `show`.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
 
 fn open_profiler_ro(db_path: &str) -> Profiler {
     match Profiler::new(db_path) {

@@ -108,11 +108,34 @@ impl Profiler {
         // Remove events are logged but not scored. Sysfs attributes are gone
         // by the time the remove uevent arrives, so use the fingerprint we
         // recorded when the device was last seen on this port.
+        // Profile update and event-log append commit together, so a failed
+        // append can't leave a device "known" with no logged event.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match self.process_event_inner(event) {
+            Ok(result) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(result)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn process_event_inner(
+        &mut self,
+        event: &UsbEvent,
+    ) -> Result<AnomalyResult, Box<dyn std::error::Error>> {
         if event.action == "remove" {
-            let fingerprint = self
-                .last_fp_by_port
-                .remove(&event.port_path)
-                .unwrap_or_else(|| compute_fingerprint(event));
+            // After a daemon restart the in-memory map is empty; fall back to
+            // the profile last recorded on this port.
+            let fingerprint = match self.last_fp_by_port.remove(&event.port_path) {
+                Some(fp) => fp,
+                None => self
+                    .get_fingerprint_by_port(&event.port_path)?
+                    .unwrap_or_else(|| compute_fingerprint(event)),
+            };
             let known = self.get_profile_by_fingerprint(&fingerprint)?;
             let result = AnomalyResult {
                 event: event.clone(),
@@ -284,7 +307,7 @@ impl Profiler {
         )?;
 
         #[allow(clippy::type_complexity)]
-        let rows: Vec<(u64, String, String, String, String, u32, Option<String>, Option<String>, String)> = stmt
+        let rows: Vec<rusqlite::Result<(u64, String, String, String, String, u32, Option<String>, Option<String>, String)>> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?.max(0) as u64,
@@ -292,25 +315,37 @@ impl Profiler {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
-                    row.get::<_, i64>(5)?.max(0) as u32,
+                    // Out-of-range scores can't have been written by us.
+                    row.get::<_, u32>(5)?,
                     row.get(6)?,
                     row.get(7)?,
                     row.get(8)?,
                 ))
             })?
-            .filter_map(|r| match r {
-                Ok(v) => Some(v),
-                Err(e) => { warn!("Skipping malformed DB row: {}", e); None }
-            })
             .collect();
 
         let total = rows.len() as u64;
         let mut broken: Vec<BrokenLink> = Vec::new();
         let mut expected_prev: &str = "genesis";
+        // Rows that fail to decode were tampered with (or corrupted); report
+        // them instead of skipping, otherwise a mangled final row verifies.
+        let mut last_id: u64 = 0;
 
-        for (id, timestamp, action, fingerprint, raw_json, score, flags, prev_hash, row_hash) in
-            &rows
-        {
+        for row in &rows {
+            let (id, timestamp, action, fingerprint, raw_json, score, flags, prev_hash, row_hash) =
+                match row {
+                    Ok(v) => v,
+                    Err(e) => {
+                        broken.push(BrokenLink {
+                            event_id: last_id + 1,
+                            reason: format!("malformed row after event {}: {}", last_id, e),
+                        });
+                        expected_prev = "<malformed>";
+                        continue;
+                    }
+                };
+            last_id = *id;
+
             // Check that prev_hash matches what we computed from the prior row
             let stored_prev = prev_hash.as_deref().unwrap_or("genesis");
             if stored_prev != expected_prev {
@@ -434,6 +469,24 @@ impl Profiler {
         Ok(profile)
     }
 
+    fn get_fingerprint_by_port(
+        &self,
+        port_path: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let fp = self
+            .conn
+            .query_row(
+                "SELECT fingerprint FROM devices
+                  WHERE port_path = ?1
+                  ORDER BY last_seen DESC
+                  LIMIT 1",
+                params![port_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(fp)
+    }
+
     fn get_profiles_by_vid_pid(
         &self,
         vid: &str,
@@ -541,19 +594,23 @@ fn score_event(
         flags.push(AnomalyFlag::DescriptorMismatch);
     }
 
+    // ── NEW_PORT (+10) ───────────────────────────────────────────────────────
     if let Some(ref profile) = exact_match {
-        // ── NEW_PORT (+10) ───────────────────────────────────────────────────
         if profile.port_path != event.port_path {
             flags.push(AnomalyFlag::NewPort);
         }
+    }
 
-        // ── NEW_INTERFACE_COUNT (+40) ────────────────────────────────────────
-        if let (Some(stored), Some(current)) =
-            (profile.interface_count, event.interface_count)
-        {
-            if stored != current {
-                flags.push(AnomalyFlag::NewInterfaceCount);
-            }
+    // ── NEW_INTERFACE_COUNT (+40) ────────────────────────────────────────────
+    // Interface count is part of the fingerprint, so an exact match always
+    // has the same count; compare against the VID/PID history instead.
+    if let Some(current) = event.interface_count {
+        let known_counts: Vec<u8> = vid_pid_matches
+            .iter()
+            .filter_map(|p| p.interface_count)
+            .collect();
+        if !known_counts.is_empty() && !known_counts.contains(&current) {
+            flags.push(AnomalyFlag::NewInterfaceCount);
         }
     }
 
@@ -567,7 +624,7 @@ fn score_event(
     }
 
     // ── ODD_HOURS (+10) ──────────────────────────────────────────────────────
-    let local_hour = Local::now().hour();
+    let local_hour = event.timestamp.with_timezone(&Local).hour();
     if (1..5).contains(&local_hour) {
         flags.push(AnomalyFlag::OddHours);
     }
@@ -836,6 +893,42 @@ mod tests {
             .execute("UPDATE events SET anomaly_score = 0 WHERE id = 1", [])
             .unwrap();
         assert!(!p2.verify_chain().unwrap().is_ok());
+    }
+
+    #[test]
+    fn interface_count_change_on_known_vid_pid_flags() {
+        let mut p = Profiler::new(":memory:").unwrap();
+        p.process_event(&make_event("add", Some("Keyboard"), Some("SN1"))).unwrap();
+        let mut reflashed = make_event("add", Some("Keyboard"), Some("SN1"));
+        reflashed.interface_count = Some(2);
+        let result = p.process_event(&reflashed).unwrap();
+        assert!(result.flags.contains(&AnomalyFlag::NewInterfaceCount));
+        assert!(result.flags.contains(&AnomalyFlag::DescriptorMismatch));
+    }
+
+    #[test]
+    fn remove_after_restart_correlates_via_port() {
+        let mut p = Profiler::new(":memory:").unwrap();
+        let added = p.process_event(&make_event("add", Some("Keyboard"), Some("SN1"))).unwrap();
+        let add_fp = compute_fingerprint(&added.event);
+        p.last_fp_by_port.clear(); // simulate daemon restart
+
+        let mut removal = make_event("remove", None, None);
+        removal.manufacturer = None;
+        removal.interface_count = None;
+        p.process_event(&removal).unwrap();
+        assert_eq!(p.recent_events(1).unwrap()[0].fingerprint, add_fp);
+    }
+
+    #[test]
+    fn malformed_last_row_breaks_chain() {
+        let mut p = Profiler::new(":memory:").unwrap();
+        p.process_event(&make_event("add", Some("Keyboard"), Some("SN1"))).unwrap();
+        p.process_event(&make_event("bind", Some("Keyboard"), Some("SN1"))).unwrap();
+        p.conn
+            .execute("UPDATE events SET anomaly_score = 'x' WHERE id = 2", [])
+            .unwrap();
+        assert!(!p.verify_chain().unwrap().is_ok());
     }
 }
 
