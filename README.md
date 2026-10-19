@@ -35,7 +35,7 @@ Ghostwire is a passive daemon written in Rust that listens to kernel uevents on 
 | `DESCRIPTOR_MISMATCH` | +50 | VID/PID known, but descriptor fingerprint is new — possible BadUSB reflash |
 | `NEW_PORT` | +10 | Known device appeared on a different physical port |
 | `COMPOSITE_HID_STORAGE` | +60 | Device exposes both HID and mass-storage interfaces |
-| `NEW_INTERFACE_COUNT` | +40 | Interface count differs from the stored profile |
+| `NEW_INTERFACE_COUNT` | +40 | Interface count differs from every stored profile with the same VID/PID |
 | `ODD_HOURS` | +10 | Event occurred between 01:00 and 04:59 local time |
 | `SERIAL_MISSING` | +15 | HID or storage device with no serial number |
 
@@ -111,9 +111,9 @@ ghostwire [--db-path <path>] [--log-path <path>] [-f|--foreground] [--notify] [C
   daemon              Run the daemon (default when no subcommand is given)
   list                List all known device profiles in the trust store
   show <fingerprint>  Show full details for one profile (prefix match supported)
-  trust <fingerprint>   Mark a device as explicitly trusted
-  untrust <fingerprint> Remove the trusted flag
-  forget <fingerprint>  Delete a profile (historical events are preserved)
+  trust <fingerprint>   Mark a device as explicitly trusted (prefix match supported)
+  untrust <fingerprint> Remove the trusted flag (prefix match supported)
+  forget <fingerprint>  Delete a profile; historical events are preserved (prefix match supported)
   history [-l N]      Show recent USB events with anomaly scores
   export              Dump the full event log as JSON to stdout
   verify              Verify the tamper-evident event chain (exit 1 if broken)
@@ -182,7 +182,7 @@ Know what this tool does *not* do:
 
 - **Perfect clones are invisible.** A device that reproduces an enrolled device's descriptors exactly (VID, PID, strings, class, interface count) produces the same fingerprint and is treated as that device. Serial numbers are excluded from the fingerprint precisely because they are spoofable, so a spoofed serial neither helps nor hurts an attacker here.
 - **Detection is heuristic.** Scores are static weights, not a learned model; expect to tune your workflow around `trust` to suppress noise from legitimate new hardware. `ODD_HOURS` uses the daemon host's local clock. There is no enumeration-*timing* signal: the only timing observable from uevents (kernel `add`→`bind` latency) is sub-millisecond for every device and distinguishes nothing.
-- **The hash chain covers the full event record** (timestamp, action, fingerprint, raw event JSON, score, flags, previous hash) — it makes modification, deletion, and reordering of logged events evident, but is not a substitute for shipping logs off-host. The chain format changed pre-1.0; event logs written by earlier builds will fail `verify`.
+- **The hash chain covers the full event record** (timestamp, action, fingerprint, raw event JSON, score, flags, previous hash) — it makes modification, mid-chain deletion, and reordering of logged events evident. It is unkeyed, so anyone with write access to the database can truncate the tail or rebuild the whole chain; it is not a substitute for shipping logs off-host. The chain format changed pre-1.0; event logs written by earlier builds will fail `verify`.
 - **No webhook/network output yet** — alerting beyond the log file and desktop notifications is up to your log shipper.
 
 ---

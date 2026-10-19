@@ -574,6 +574,7 @@ dependencies = [
  "chrono",
  "clap",
  "hex",
+ "libc",
  "netlink-sys",
  "notify-rust",
  "rusqlite",
