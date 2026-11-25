@@ -572,7 +572,7 @@ impl Profiler {
 }
 
 // =============================================================================
-// Anomaly scoring (Phase 3 — all 7 flags)
+// Anomaly scoring (Phase 3)
 // =============================================================================
 
 fn score_event(
@@ -594,9 +594,23 @@ fn score_event(
         flags.push(AnomalyFlag::DescriptorMismatch);
     }
 
+    // Explicit trust: a device the operator vouched for (exact fingerprint
+    // match) has its context-only flags suppressed. Structural flags
+    // (descriptor changes, composite HID+storage) are never suppressed.
+    let trusted = exact_match.as_ref().map_or(false, |p| p.trusted);
+
+    // ── UNTRUSTED_DEVICE (+30) ───────────────────────────────────────────────
+    // Registered on first sight but never vouched for. Without this a device
+    // is only suspicious the first time it is plugged in.
+    if let Some(ref profile) = exact_match {
+        if !profile.trusted && event.action == "add" {
+            flags.push(AnomalyFlag::UntrustedDevice);
+        }
+    }
+
     // ── NEW_PORT (+10) ───────────────────────────────────────────────────────
     if let Some(ref profile) = exact_match {
-        if profile.port_path != event.port_path {
+        if !trusted && profile.port_path != event.port_path {
             flags.push(AnomalyFlag::NewPort);
         }
     }
@@ -625,14 +639,14 @@ fn score_event(
 
     // ── ODD_HOURS (+10) ──────────────────────────────────────────────────────
     let local_hour = event.timestamp.with_timezone(&Local).hour();
-    if (1..5).contains(&local_hour) {
+    if !trusted && (1..5).contains(&local_hour) {
         flags.push(AnomalyFlag::OddHours);
     }
 
     // ── SERIAL_MISSING (+15) ─────────────────────────────────────────────────
     // HID and mass-storage devices are expected to carry a serial number.
     // Legitimate devices almost always have one; BadUSBs often don't bother.
-    if (has_hid || has_storage) && event.serial.is_none() {
+    if !trusted && (has_hid || has_storage) && event.serial.is_none() {
         flags.push(AnomalyFlag::SerialMissing);
     }
 
@@ -845,6 +859,56 @@ mod tests {
         let result = p.process_event(&make_event("add", Some("Kbd Pro"), Some("SN1"))).unwrap();
         assert!(result.flags.contains(&AnomalyFlag::DescriptorMismatch));
         assert!(!result.flags.contains(&AnomalyFlag::UnknownDevice));
+    }
+
+    #[test]
+    fn unknown_hid_without_serial_reaches_alert_threshold() {
+        // Default alert threshold is 50: a never-seen HID with no serial
+        // (the classic injection-device profile) must alert on its own.
+        let mut p = Profiler::new(":memory:").unwrap();
+        let result = p.process_event(&make_event("add", Some("Keyboard"), None)).unwrap();
+        assert!(result.score >= 50, "score was {}", result.score);
+    }
+
+    #[test]
+    fn untrusted_device_flagged_on_reconnect_until_trusted() {
+        let mut p = Profiler::new(":memory:").unwrap();
+        let ev = make_event("add", Some("Keyboard"), None);
+        p.process_event(&ev).unwrap();
+
+        // Second plug-in: known fingerprint, but never trusted.
+        let again = p.process_event(&ev).unwrap();
+        assert!(again.flags.contains(&AnomalyFlag::UntrustedDevice));
+        assert!(again.score >= 50, "score was {}", again.score);
+
+        // The bind that follows the same plug-in is not double-counted.
+        let bind = p.process_event(&make_event("bind", Some("Keyboard"), None)).unwrap();
+        assert!(!bind.flags.contains(&AnomalyFlag::UntrustedDevice));
+
+        // Once trusted, the device is quiet.
+        let fp = compute_fingerprint(&ev);
+        assert!(p.trust_device(&fp).unwrap());
+        let trusted = p.process_event(&ev).unwrap();
+        assert!(stable_flags(&trusted).is_empty(), "{:?}", trusted.flags);
+    }
+
+    #[test]
+    fn trust_suppresses_context_flags_but_not_structural_ones() {
+        let mut p = Profiler::new(":memory:").unwrap();
+        let ev = make_event("add", Some("Keyboard"), None);
+        p.process_event(&ev).unwrap();
+        p.trust_device(&compute_fingerprint(&ev)).unwrap();
+
+        // Trusted device on a new port with no serial: no NEW_PORT/SERIAL_MISSING.
+        let mut moved = ev.clone();
+        moved.port_path = "/devices/usb1/1-4".to_string();
+        let r = p.process_event(&moved).unwrap();
+        assert!(!r.flags.contains(&AnomalyFlag::NewPort));
+        assert!(!r.flags.contains(&AnomalyFlag::SerialMissing));
+
+        // A changed descriptor under the same VID/PID is still flagged.
+        let r = p.process_event(&make_event("add", Some("Kbd Pro"), None)).unwrap();
+        assert!(r.flags.contains(&AnomalyFlag::DescriptorMismatch));
     }
 
     #[test]

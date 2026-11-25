@@ -19,7 +19,7 @@ Ghostwire is a passive daemon written in Rust that listens to kernel uevents on 
 
 - **Passive fingerprinting** — SHA-256 fingerprint over vendor/product IDs, manufacturer and product strings, device class, and interface count. Serial numbers are deliberately excluded from the fingerprint because they're trivially spoofable.
 - **Automatic baselining** — every device is profiled on first sight and tracked across reconnects (first/last seen, seen count, port history). Devices can be explicitly marked trusted via the CLI.
-- **Anomaly scoring** — each event is scored against seven weighted detection flags (see below); severity escalates with the cumulative score.
+- **Anomaly scoring** — each event is scored against eight weighted detection flags (see below); severity escalates with the cumulative score.
 - **Tamper-evident event log** — every event is appended to a SQLite log with a SHA-256 hash chain covering the full event record; `ghostwire verify` walks the chain and reports broken links.
 - **Structured output** — human/journald logs via `tracing`, plus a newline-delimited JSON event log for SIEM ingestion, plus optional desktop notifications.
 
@@ -32,23 +32,24 @@ Ghostwire is a passive daemon written in Rust that listens to kernel uevents on 
 | Flag | Score | Trigger |
 |------|------:|---------|
 | `UNKNOWN_DEVICE` | +30 | Fingerprint never seen and no VID/PID history at all |
+| `UNTRUSTED_DEVICE` | +30 | Known fingerprint that has never been marked trusted (checked on `add` only) |
 | `DESCRIPTOR_MISMATCH` | +50 | VID/PID known, but descriptor fingerprint is new — possible BadUSB reflash |
 | `NEW_PORT` | +10 | Known device appeared on a different physical port |
 | `COMPOSITE_HID_STORAGE` | +60 | Device exposes both HID and mass-storage interfaces |
 | `NEW_INTERFACE_COUNT` | +40 | Interface count differs from every stored profile with the same VID/PID |
 | `ODD_HOURS` | +10 | Event occurred between 01:00 and 04:59 local time |
-| `SERIAL_MISSING` | +15 | HID or storage device with no serial number |
+| `SERIAL_MISSING` | +20 | HID or storage device with no serial number |
 
-Flag scores are additive. Severity thresholds: **score ≥ 50** logs at ERROR (and fires a desktop notification if enabled), **score ≥ 20** logs at WARN, everything else at INFO. Both thresholds are configurable (`alert_threshold`, `warn_threshold` — see Configuration).
+Flag scores are additive. A device marked trusted with `ghostwire trust` has `NEW_PORT`, `ODD_HOURS` and `SERIAL_MISSING` suppressed; structural flags (`DESCRIPTOR_MISMATCH`, `NEW_INTERFACE_COUNT`, `COMPOSITE_HID_STORAGE`) always apply. A never-seen HID device with no serial scores 50 and alerts on its own. Severity thresholds: **score ≥ 50** logs at ERROR (and fires a desktop notification if enabled), **score ≥ 20** logs at WARN, everything else at INFO. Both thresholds are configurable (`alert_threshold`, `warn_threshold` — see Configuration).
 
 ## Attack Surface Coverage
 
 | Attack Type | Example | Detection Signal |
 |-------------|---------|-----------------|
 | BadUSB / Firmware implant | Reprogrammed microcontroller spoofing HID | `DESCRIPTOR_MISMATCH`, `NEW_INTERFACE_COUNT` |
-| HID Injection | USB Rubber Ducky, O.MG Cable | `UNKNOWN_DEVICE` + `SERIAL_MISSING` |
+| HID Injection | USB Rubber Ducky, O.MG Cable | `UNKNOWN_DEVICE` + `SERIAL_MISSING` (alerts), then `UNTRUSTED_DEVICE` on every later plug-in |
 | Composite implant | HID payload with staging storage | `COMPOSITE_HID_STORAGE` |
-| Malicious charging cable | O.MG cable, OMG Plug | `UNKNOWN_DEVICE` on a previously clean port, `NEW_PORT` |
+| Malicious charging cable | O.MG cable, OMG Plug | `UNKNOWN_DEVICE` on a previously clean port, `NEW_PORT`, `UNTRUSTED_DEVICE` |
 
 ---
 

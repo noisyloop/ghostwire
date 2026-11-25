@@ -63,6 +63,9 @@ pub struct AnomalyResult {
 pub enum AnomalyFlag {
     /// Device has never been seen before. (+30)
     UnknownDevice,
+    /// Device is in the trust store but has not been explicitly trusted. (+30)
+    /// Fires on `add` only, so one plug-in is not double-counted with `bind`.
+    UntrustedDevice,
     /// VID/PID is known but descriptor strings differ — possible BadUSB. (+50)
     DescriptorMismatch,
     /// Known device appeared on a different physical port. (+10)
@@ -73,7 +76,7 @@ pub enum AnomalyFlag {
     NewInterfaceCount,
     /// Event occurred between 01:00–05:00 local time. (+10)
     OddHours,
-    /// Device class expects a serial number but none was provided. (+15)
+    /// Device class expects a serial number but none was provided. (+20)
     SerialMissing,
 }
 
@@ -81,18 +84,20 @@ impl AnomalyFlag {
     pub fn score(&self) -> u32 {
         match self {
             AnomalyFlag::UnknownDevice => 30,
+            AnomalyFlag::UntrustedDevice => 30,
             AnomalyFlag::DescriptorMismatch => 50,
             AnomalyFlag::NewPort => 10,
             AnomalyFlag::CompositeHidStorage => 60,
             AnomalyFlag::NewInterfaceCount => 40,
             AnomalyFlag::OddHours => 10,
-            AnomalyFlag::SerialMissing => 15,
+            AnomalyFlag::SerialMissing => 20,
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
             AnomalyFlag::UnknownDevice => "UNKNOWN_DEVICE",
+            AnomalyFlag::UntrustedDevice => "UNTRUSTED_DEVICE",
             AnomalyFlag::DescriptorMismatch => "DESCRIPTOR_MISMATCH",
             AnomalyFlag::NewPort => "NEW_PORT",
             AnomalyFlag::CompositeHidStorage => "COMPOSITE_HID_STORAGE",
